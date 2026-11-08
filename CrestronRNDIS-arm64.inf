@@ -1,6 +1,11 @@
 ; Unofficial ARM64 binding for Crestron devices that present USB-Ethernet (RNDIS),
 ; VID_0525&PID_A4A2. Same as Crestron's CrestronRNDIS.inf plus an NTarm64
 ; decoration. Uses the inbox netrndis.inf / rndismp6.sys - no binaries shipped.
+;
+; CAUTION: VID_0525&PID_A4A2 is the stock Linux USB gadget (g_ether / RNDIS) ID,
+; not a Crestron-assigned one. Installed system-wide, this INF would claim ANY
+; Linux RNDIS gadget (dev boards, other vendors' devices), not just Crestron's.
+; Install.ps1 does not handle this device at all.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -34,5 +39,5 @@ include = netrndis.inf
 needs   = usbrndis6.ndi.Services
 
 [Strings]
-ProviderName = "DMI (unofficial ARM64 binding)"
+ProviderName = "ArmUsb (unofficial ARM64 binding)"
 RndisDevice  = "Crestron USB Ethernet (RNDIS, ARM64)"

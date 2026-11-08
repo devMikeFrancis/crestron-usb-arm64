@@ -1,8 +1,9 @@
 # Shared helpers for Install.ps1 / Uninstall.ps1. Dot-sourced, not run directly.
 # Keep this file pure ASCII: Windows PowerShell 5.1 misreads BOM-less UTF-8.
 
-$script:StateDir  = Join-Path $env:ProgramData 'ArmUsb'
-$script:StateFile = Join-Path $script:StateDir 'state.json'
+# Earlier versions kept a state file here. Nothing reads it now; Uninstall.ps1
+# still deletes the folder if it exists.
+$script:StateDir = Join-Path $env:ProgramData 'ArmUsb'
 
 # Toolbox enumerates Crestron USB devices on this interface GUID (from Crestron's
 # CtrnWinUsb.inf). WinUSB registers it when DeviceInterfaceGUIDs is set.
@@ -10,46 +11,36 @@ $script:CrestronInterfaceGuid = '{0251445b-4b22-4ec7-b1c9-37f36e587b13}'
 
 # The VID/PIDs Crestron's CtrnWinUsb.inf binds. 0003/0004/0007 originally also
 # load a Crestron kernel filter with no ARM64 build; here they get plain WinUSB.
+# The filter narrows the PnP query; the pattern is the exact match.
+$script:CrestronIdFilter  = 'USB\VID_14BE&PID_*'
 $script:CrestronIdPattern = '^USB\\VID_14BE&PID_(0003|0004|0007|0009|001[0-7])\\'
+
+# pnputil exit codes that mean success. 3010 = success, restart required.
+$script:PnpUtilSuccess = @(0, 3010)
 
 # Left behind by the first (signed-package) version of this tool, which ARM64
 # Windows rejects. Still cleaned up so an old install does not linger.
+# Matched by provider name only: the INFs in this repo now use a different
+# provider, so a future signed release of them is never taken for v1.
 $script:LegacyCertSubject  = 'CN=ArmUsb Local Driver Signer'
 $script:LegacyProviderName = 'DMI (unofficial ARM64 binding)'
-$script:LegacyInfNames     = @('CrestronWinUsb-arm64.inf', 'CrestronRNDIS-arm64.inf')
+$script:LegacyDriverCache  = $null
 
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Relaunch the calling script elevated, forwarding its parameters. Returns $true
-# if a relaunch happened (the caller should then exit).
-function Invoke-SelfElevated {
-    param([string]$ScriptPath, [hashtable]$BoundParameters)
-    if (Test-IsAdmin) { return $false }
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ScriptPath`"")
-    foreach ($k in $BoundParameters.Keys) {
-        $v = $BoundParameters[$k]
-        if ($v -is [System.Management.Automation.SwitchParameter]) {
-            if ($v.IsPresent) { $argList += "-$k" }
-        } else {
-            $argList += "-$k"; $argList += "`"$v`""
-        }
-    }
-    $argList += '-PauseAtEnd'
-    Write-Host 'Requesting administrator rights (a UAC prompt will appear)...'
-    try {
-        Start-Process -FilePath (Get-NativePowerShell) -Verb RunAs -ArgumentList $argList -Wait
-    } catch {
-        Write-Error 'Administrator rights are required and were not granted.'
-    }
-    return $true
-}
-
 # The real OS architecture, even when this PowerShell is itself emulated.
 function Get-OsArchitecture {
     (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').PROCESSOR_ARCHITECTURE
+}
+
+# Is this PowerShell native to the OS? An emulated one (x64 or x86 on ARM64, x86
+# on x64) reports its own architecture in PROCESSOR_ARCHITECTURE. Device setup
+# must run native; a 64-bit check alone lets x64-emulated PowerShell through.
+function Test-NativeProcess {
+    ($env:PROCESSOR_ARCHITECTURE -ieq (Get-OsArchitecture)) -and -not $env:PROCESSOR_ARCHITEW6432
 }
 
 # An x86 (emulated) PowerShell sees SysWOW64 as System32; reach the native tools.
@@ -61,17 +52,59 @@ function Get-NativeSystemDir {
 function Get-PnpUtil          { Join-Path (Get-NativeSystemDir) 'pnputil.exe' }
 function Get-NativePowerShell { Join-Path (Get-NativeSystemDir) 'WindowsPowerShell\v1.0\powershell.exe' }
 
+# Relaunches the calling script in native PowerShell, elevated unless -NoElevate,
+# when this process is not already that. Returns the relaunched script's exit
+# code (the caller should exit with it), or $null if no relaunch was needed.
+function Invoke-SelfRelaunch {
+    param([string]$ScriptPath, [hashtable]$BoundParameters, [switch]$NoElevate)
+    $elevate = -not $NoElevate -and -not (Test-IsAdmin)
+    if (-not $elevate -and (Test-NativeProcess)) { return $null }
+
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$ScriptPath`"")
+    foreach ($k in $BoundParameters.Keys) {
+        if ($k -eq 'PauseAtEnd') { continue }   # added once below
+        $v = $BoundParameters[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter]) {
+            if ($v.IsPresent) { $argList += "-$k" }
+        } else {
+            $argList += "-$k"; $argList += "`"$v`""
+        }
+    }
+    $start = @{ FilePath = (Get-NativePowerShell); Wait = $true; PassThru = $true }
+    if ($elevate) {
+        # The elevated script gets its own window; keep it open to be read.
+        $argList += '-PauseAtEnd'
+        $start.Verb = 'RunAs'
+        Write-Host 'Requesting administrator rights (a UAC prompt will appear)...'
+    } else {
+        if ($BoundParameters.ContainsKey('PauseAtEnd')) { $argList += '-PauseAtEnd' }
+        $start.NoNewWindow = $true
+        Write-Host 'Restarting in native PowerShell...'
+    }
+    $start.ArgumentList = $argList
+    try {
+        $p = Start-Process @start
+    } catch {
+        Write-Host 'Administrator rights are required and were not granted.' -ForegroundColor Red
+        return 1
+    }
+    return [int]$p.ExitCode
+}
+
 function Invoke-PnpUtil {
     param([string[]]$Arguments)
     $out = & (Get-PnpUtil) @Arguments 2>&1 | Out-String
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.Trim() }
 }
 
-function Get-DeviceProp {
-    param([string]$InstanceId, [string]$Key)
-    $p = Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $Key -ErrorAction SilentlyContinue -WhatIf:$false
-    # A property the device lacks comes back with no Data member at all.
-    if ($p -and $p.PSObject.Properties['Data']) { $p.Data } else { $null }
+# Restarts a device. Returns $true if Windows must restart to finish.
+function Restart-UsbDevice {
+    param([string]$InstanceId)
+    $r = Invoke-PnpUtil @('/restart-device', $InstanceId)
+    if ($script:PnpUtilSuccess -notcontains $r.ExitCode) {
+        throw "restart failed (exit $($r.ExitCode)): $($r.Output)"
+    }
+    $r.ExitCode -eq 3010
 }
 
 function Get-DeviceInterfaceGuids {
@@ -84,58 +117,68 @@ function Get-DeviceInterfaceGuids {
 # Crestron USB devices Windows knows about. -All includes ones not plugged in now.
 function Get-CrestronUsbDevices {
     param([switch]$All)
-    $devs = if ($All) { Get-PnpDevice -ErrorAction SilentlyContinue } else { Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue }
-    foreach ($d in @($devs | Where-Object { $_.InstanceId -match $script:CrestronIdPattern })) {
-        $guids = @(Get-DeviceInterfaceGuids $d.InstanceId)
+    $query = @{ InstanceId = $script:CrestronIdFilter; ErrorAction = 'SilentlyContinue' }
+    if (-not $All) { $query.PresentOnly = $true }
+    $devs = @(Get-PnpDevice @query | Where-Object { $_.InstanceId -match $script:CrestronIdPattern })
+    if (-not $devs.Count) { return }
+
+    # One pipelined query for every device and key: much faster than a call per
+    # property. (The -InstanceId array form of this cmdlet returns wrong results.)
+    # A property the device lacks comes back with no Data member at all.
+    $keys = 'DEVPKEY_Device_IsPresent', 'DEVPKEY_Device_Service', 'DEVPKEY_Device_DriverInfPath'
+    $props = @{}
+    $devs | Get-PnpDeviceProperty -KeyName $keys -ErrorAction SilentlyContinue -WhatIf:$false | ForEach-Object {
+        if ($_.PSObject.Properties['Data']) { $props["$($_.InstanceId)|$($_.KeyName)"] = $_.Data }
+    }
+    foreach ($d in $devs) {
+        $id = $d.InstanceId
+        $guids = @(Get-DeviceInterfaceGuids $id)
         [pscustomobject]@{
-            InstanceId = $d.InstanceId
+            InstanceId = $id
             Name       = $d.FriendlyName
             Status     = $d.Status
-            Present    = [bool](Get-DeviceProp $d.InstanceId 'DEVPKEY_Device_IsPresent')
-            Service    = [string](Get-DeviceProp $d.InstanceId 'DEVPKEY_Device_Service')
-            InfPath    = [string](Get-DeviceProp $d.InstanceId 'DEVPKEY_Device_DriverInfPath')
+            Present    = [bool]$props["$id|DEVPKEY_Device_IsPresent"]
+            Service    = [string]$props["$id|DEVPKEY_Device_Service"]
+            InfPath    = [string]$props["$id|DEVPKEY_Device_DriverInfPath"]
             HasGuid    = [bool]($guids | Where-Object { $_ -eq $script:CrestronInterfaceGuid })
         }
     }
 }
 
 # Is the Crestron interface registered and enabled on this device right now?
+# Asks the PnP manager directly; parsing pnputil's text broke on non-English Windows.
 function Test-CrestronInterfaceEnabled {
     param([string]$InstanceId)
-    $r = Invoke-PnpUtil @('/enum-interfaces', '/class', $script:CrestronInterfaceGuid)
-    $current = $null
-    foreach ($line in ($r.Output -split "`r?`n")) {
-        if ($line -match '^\s*Device Instance ID:\s*(.+?)\s*$') { $current = $Matches[1] }
-        elseif ($line -match '^\s*Interface Status:\s*Enabled' -and $current -and $current -ieq $InstanceId) { return $true }
+    Initialize-Binder
+    [ArmUsb.WinUsbBinder]::IsInterfaceEnabled($InstanceId, $script:CrestronInterfaceGuid)
+}
+
+# Waits for the interface to come up after a bind or restart, which is not
+# instant. Returns $true once it is enabled, $false on timeout.
+function Wait-CrestronInterface {
+    param([string]$InstanceId, [int]$TimeoutMs = 5000)
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ($true) {
+        if (Test-CrestronInterfaceEnabled $InstanceId) { return $true }
+        if ([DateTime]::UtcNow -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
     }
-    return $false
-}
-
-function Read-ArmUsbState {
-    if (-not (Test-Path $script:StateFile)) { return @() }
-    try { @((Get-Content $script:StateFile -Raw | ConvertFrom-Json).Devices | Where-Object { $_ }) } catch { @() }
-}
-
-function Write-ArmUsbState {
-    param([string[]]$Devices)
-    New-Item -ItemType Directory -Force -Path $script:StateDir | Out-Null
-    [pscustomobject]@{
-        UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
-        Devices    = @($Devices | Sort-Object -Unique)
-    } | ConvertTo-Json | Set-Content -Path $script:StateFile -Encoding ASCII
 }
 
 # --- Legacy (v1 signed package) cleanup -------------------------------------
 
 function Get-LegacyDriverPackages {
+    param([switch]$Refresh)
     # Get-WindowsDriver needs elevation; a non-admin -WhatIf run just cannot see them.
     if (-not (Test-IsAdmin)) { return }
-    # Reading only: keep -WhatIf from turning the DISM module import into noise.
-    $WhatIfPreference = $false
-    Get-WindowsDriver -Online -ErrorAction SilentlyContinue | Where-Object {
-        ($script:LegacyInfNames -contains (Split-Path $_.OriginalFileName -Leaf)) -or
-        ($_.ProviderName -eq $script:LegacyProviderName)
+    # Get-WindowsDriver takes seconds, so ask it once per run.
+    if ($Refresh -or $null -eq $script:LegacyDriverCache) {
+        # Reading only: keep -WhatIf from turning the DISM module import into noise.
+        $WhatIfPreference = $false
+        $script:LegacyDriverCache = @(Get-WindowsDriver -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -eq $script:LegacyProviderName })
     }
+    $script:LegacyDriverCache
 }
 
 function Get-LegacyCertificates {
@@ -145,17 +188,28 @@ function Get-LegacyCertificates {
     }
 }
 
+function Test-LegacyInstall {
+    [bool](@(Get-LegacyCertificates).Count -or @(Get-LegacyDriverPackages).Count)
+}
+
 # Removes v1 driver packages and signer certs. Returns a list of problems.
 function Remove-LegacyInstall {
     param([scriptblock]$Say = { param($m) Write-Host $m })
     $problems = @()
+    $failed = @()
     foreach ($p in @(Get-LegacyDriverPackages)) {
         & $Say "Removing old driver package $($p.Driver)"
         $r = Invoke-PnpUtil @('/delete-driver', $p.Driver, '/uninstall', '/force')
-        if ($r.ExitCode -ne 0 -and $r.ExitCode -ne 3010 -and @(Get-LegacyDriverPackages | Where-Object Driver -eq $p.Driver).Count) {
-            $problems += "pnputil could not delete $($p.Driver) (exit $($r.ExitCode)): $($r.Output)"
+        if ($script:PnpUtilSuccess -notcontains $r.ExitCode) { $failed += [pscustomobject]@{ Driver = $p.Driver; Result = $r } }
+    }
+    if ($failed.Count) {
+        # pnputil can report an error yet have removed the package; check before blaming it.
+        $left = @(Get-LegacyDriverPackages -Refresh | ForEach-Object { $_.Driver })
+        foreach ($f in $failed | Where-Object { $left -contains $_.Driver }) {
+            $problems += "pnputil could not delete $($f.Driver) (exit $($f.Result.ExitCode)): $($f.Result.Output)"
         }
     }
+    $script:LegacyDriverCache = $null
     foreach ($c in @(Get-LegacyCertificates)) {
         $store = $c.PSParentPath | Split-Path -Leaf
         & $Say "Removing old signing certificate from $store"
@@ -192,6 +246,9 @@ namespace ArmUsb {
     const uint DIIDFLAG_NOFINISHINSTALLUI = 2;
     const int ERROR_NO_MORE_ITEMS = 259;
     const int ERROR_INSUFFICIENT_BUFFER = 122;
+    const int CR_SUCCESS = 0;
+    const int CR_BUFFER_SMALL = 0x1A;
+    const uint CM_GET_DEVICE_INTERFACE_LIST_PRESENT = 0;
     // SP_DRVINFO_DETAIL_DATA_W on 64-bit: fixed size and offset of HardwareID.
     const int DETAIL_CBSIZE = 1584;
     const int DETAIL_HWID_OFFSET = 1576;
@@ -247,6 +304,10 @@ namespace ArmUsb {
     static extern IntPtr SetupDiCreateDevRegKeyW(IntPtr set, ref SP_DEVINFO_DATA dev, uint scope, uint profile, uint keyType, IntPtr infHandle, string infSection);
     [DllImport("newdev.dll", SetLastError = true)]
     static extern bool DiInstallDevice(IntPtr hwnd, IntPtr set, ref SP_DEVINFO_DATA dev, ref SP_DRVINFO_DATA drv, uint flags, out int needReboot);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern int CM_Get_Device_Interface_List_SizeW(out uint len, ref Guid cls, string deviceId, uint flags);
+    [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)]
+    static extern int CM_Get_Device_Interface_ListW(ref Guid cls, string deviceId, char[] buffer, uint len, uint flags);
 
     static Win32Exception Err(string what) {
       int e = Marshal.GetLastWin32Error();
@@ -365,6 +426,23 @@ namespace ArmUsb {
       } finally {
         SetupDiDestroyDeviceInfoList(set);
       }
+    }
+
+    // True if the device has an enabled interface of this class right now (what
+    // pnputil /enum-interfaces shows as "Enabled"). Not present, no such device,
+    // or no enabled interface: false.
+    public static bool IsInterfaceEnabled(string instanceId, string guid) {
+      Guid cls = new Guid(guid);
+      for (int attempt = 0; attempt < 3; attempt++) {
+        uint len;
+        if (CM_Get_Device_Interface_List_SizeW(out len, ref cls, instanceId, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS || len <= 1)
+          return false;
+        char[] buf = new char[len];
+        int cr = CM_Get_Device_Interface_ListW(ref cls, instanceId, buf, len, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+        if (cr == CR_BUFFER_SMALL) continue;  // an interface arrived between the two calls
+        return cr == CR_SUCCESS && buf[0] != '\0';
+      }
+      return false;
     }
   }
 }

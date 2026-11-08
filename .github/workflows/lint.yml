@@ -1,0 +1,45 @@
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows PowerShell 5.1 misreads BOM-less UTF-8, so the scripts stay ASCII.
+      - name: Scripts are pure ASCII
+        shell: powershell
+        run: |
+          $bad = Get-ChildItem -Recurse -Include *.ps1, *.cmd, *.inf |
+            Where-Object { [IO.File]::ReadAllBytes($_.FullName) | Where-Object { $_ -gt 127 } | Select-Object -First 1 }
+          if ($bad) { $bad.FullName; throw 'Non-ASCII bytes in the files above.' }
+
+      - name: Scripts parse in Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $failed = $false
+          foreach ($f in Get-ChildItem -Recurse -Filter *.ps1) {
+            $errors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
+            foreach ($e in $errors) { Write-Host "$($f.Name):$($e.Extent.StartLineNumber): $($e.Message)"; $failed = $true }
+          }
+          if ($failed) { throw 'Parse errors.' }
+
+      - name: C# helper compiles
+        shell: powershell
+        run: |
+          . .\lib\ArmUsb.ps1
+          Initialize-Binder
+          [ArmUsb.WinUsbBinder] | Out-Null
+
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          $issues = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+          $issues | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          if ($issues) { throw 'PSScriptAnalyzer found errors.' }
