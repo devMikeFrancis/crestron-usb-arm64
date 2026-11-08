@@ -22,6 +22,8 @@
 
     Uninstall.ps1 reverses it.
 
+    Exit code: 0 if every device is set up (or nothing needed doing), 1 otherwise.
+
 .PARAMETER Force
     Run even if this is not ARM64 Windows. On x64, use Crestron's own driver instead.
 
@@ -39,10 +41,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 . (Join-Path $PSScriptRoot 'lib\ArmUsb.ps1')
 
-# A -WhatIf run only reads, so it does not need elevation.
-if (-not $WhatIfPreference) {
-    if (Invoke-SelfElevated -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters) { return }
-}
+# Run in native PowerShell, elevated. A -WhatIf run only reads, so it does not
+# need elevation.
+$relaunchExit = Invoke-SelfRelaunch -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -NoElevate:$WhatIfPreference
+if ($null -ne $relaunchExit) { exit $relaunchExit }
 
 $exitCode = 0
 try {
@@ -55,7 +57,7 @@ try {
     if (-not (Test-Path $winusbInf)) { throw "$winusbInf is missing; this Windows has no inbox WinUSB." }
 
     # Clean up after the first version of this tool (signed package, rejected on ARM64).
-    if (@(Get-LegacyCertificates).Count -or @(Get-LegacyDriverPackages).Count) {
+    if (Test-LegacyInstall) {
         if ($PSCmdlet.ShouldProcess('old ArmUsb driver package and signing certificate', 'Remove')) {
             $legacyProblems = @(Remove-LegacyInstall)
             if ($legacyProblems.Count) { $legacyProblems | ForEach-Object { Write-Warning $_ } }
@@ -69,44 +71,55 @@ try {
         return
     }
 
-    $bound = @(Read-ArmUsbState)
+    # What to report when ShouldProcess says no: -WhatIf, or "No" at -Confirm.
+    $notDone = { param($what) if ($WhatIfPreference) { "would $what" } else { 'skipped: not confirmed' } }
+
     $results = @()
     foreach ($d in $devices) {
         $id = $d.InstanceId
         $action = ''
+        $changed = $false
+        $reboot = $false
         try {
             if ($d.Service -ieq 'WINUSB') {
                 if ($d.HasGuid -and (Test-CrestronInterfaceEnabled $id)) {
                     $action = 'already set up'
                 } elseif ($PSCmdlet.ShouldProcess($id, 'Set Toolbox interface GUID and restart device')) {
                     [ArmUsb.WinUsbBinder]::SetInterfaceGuid($id, $CrestronInterfaceGuid)
-                    $r = Invoke-PnpUtil @('/restart-device', $id)
-                    if ($r.ExitCode -ne 0) { throw "restart failed (exit $($r.ExitCode)): $($r.Output)" }
+                    $reboot = Restart-UsbDevice $id
                     $action = 'on WinUSB; interface GUID added'
+                    $changed = $true
                 } else {
-                    $action = 'would add interface GUID'
+                    $action = & $notDone 'add interface GUID'
                 }
             } elseif ($d.Service) {
                 $action = "skipped: uses driver '$($d.Service)', left alone"
             } else {
-                $reboot = $false
-                $desc = [ArmUsb.WinUsbBinder]::Bind($id, $winusbInf, $false, [ref]$reboot)
-                if ($PSCmdlet.ShouldProcess($id, "Bind to $desc")) {
+                # Previewing which driver would be picked is only for -WhatIf; a real
+                # run finds it in Bind itself, after it has set the device class.
+                $target = 'WinUSB Device (winusb.inf)'
+                if ($WhatIfPreference) {
+                    $target = [ArmUsb.WinUsbBinder]::Bind($id, $winusbInf, $false, [ref]$reboot)
+                }
+                if ($PSCmdlet.ShouldProcess($id, "Bind to $target")) {
                     [ArmUsb.WinUsbBinder]::SetInterfaceGuid($id, $CrestronInterfaceGuid)
                     [ArmUsb.WinUsbBinder]::Bind($id, $winusbInf, $true, [ref]$reboot) | Out-Null
-                    if (-not (Test-CrestronInterfaceEnabled $id)) {
-                        Invoke-PnpUtil @('/restart-device', $id) | Out-Null
+                    # WinUSB normally comes up with the interface on its own; if it
+                    # has not after a moment, a restart makes it re-read the GUID.
+                    if (-not $reboot -and -not (Wait-CrestronInterface $id -TimeoutMs 2000)) {
+                        $reboot = Restart-UsbDevice $id
                     }
-                    $action = if ($reboot) { 'bound to WinUSB (restart Windows to finish)' } else { 'bound to WinUSB' }
+                    $action = 'bound to WinUSB'
+                    $changed = $true
                 } else {
-                    $action = "would bind to $desc"
+                    $action = & $notDone "bind to $target"
                 }
             }
-            if (-not $WhatIfPreference -and $action -notlike 'skipped*') {
-                $bound += $id
-                if (-not (Test-CrestronInterfaceEnabled $id)) {
-                    throw 'finished, but Toolbox interface is not enabled on the device'
-                }
+            if ($reboot) {
+                # The interface cannot come up until Windows restarts; not a failure.
+                $action += ' (restart Windows to finish)'
+            } elseif ($changed -and -not (Wait-CrestronInterface $id)) {
+                throw 'finished, but Toolbox interface is not enabled on the device'
             }
         } catch {
             $action = "FAILED: $($_.Exception.Message)"
@@ -114,8 +127,6 @@ try {
         }
         $results += [pscustomobject]@{ Device = $id; Result = $action }
     }
-
-    if (-not $WhatIfPreference) { Write-ArmUsbState -Devices $bound }
 
     Write-Host ''
     $results | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host

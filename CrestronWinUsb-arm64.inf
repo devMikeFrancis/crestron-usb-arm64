@@ -63,7 +63,7 @@ AddReg = Dev_AddReg
 HKR,,DeviceInterfaceGUIDs,0x10000,"{0251445b-4b22-4ec7-b1c9-37f36e587b13}"
 
 [Strings]
-ProviderName            = "DMI (unofficial ARM64 binding)"
+ProviderName            = "ArmUsb (unofficial ARM64 binding)"
 DeviceClassName         = "Crestron"
 CrestronUSBDev          = "Crestron USB Device (ARM64 WinUSB)"
 GenericConsoleDev       = "Generic Crestron Console V2 Device (ARM64 WinUSB)"

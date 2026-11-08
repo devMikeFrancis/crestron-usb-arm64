@@ -62,7 +62,19 @@ packages, are not touched.
 - `CrestronWinUsb-arm64.inf`, `CrestronRNDIS-arm64.inf`: an INF version of the
   same binding. **The installer doesn't use them.** ARM64 Windows rejects
   them unless they're signed by Microsoft (attestation signing). They're kept
-  for reference and for a possible signed release.
+  for reference and for a possible signed release. The RNDIS one matches the
+  generic Linux USB-gadget ID (`VID_0525&PID_A4A2`), so it would also claim
+  non-Crestron devices.
+
+## Troubleshooting
+
+- **"Add-Type" / "Cannot add type" errors:** the installer compiles a small C#
+  helper to call Windows' device-setup API. Machines locked down with
+  Windows Defender Application Control (WDAC) or PowerShell Constrained
+  Language Mode block that. Run it on an unmanaged machine, or ask IT for an
+  exception.
+- **Exit codes:** both scripts exit 0 on success and 1 on any failure, also
+  when they relaunch themselves elevated, so they can be scripted.
 
 ## License
 

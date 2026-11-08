@@ -9,7 +9,10 @@
     are then re-detected and show as an unknown "Crestron Device" again.
 
     Also removes anything left by the first version of this tool (a signed driver
-    package and its local certificate) and %ProgramData%\ArmUsb.
+    package and its local certificate) and %ProgramData%\ArmUsb (where earlier
+    versions kept a state file).
+
+    Exit code: 0 on success, 1 if anything could not be removed.
 
     Devices on any other driver are not touched, and Crestron's own driver
     packages are never touched.
@@ -24,9 +27,8 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
 . (Join-Path $PSScriptRoot 'lib\ArmUsb.ps1')
 
-if (-not $WhatIfPreference) {
-    if (Invoke-SelfElevated -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters) { return }
-}
+$relaunchExit = Invoke-SelfRelaunch -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters -NoElevate:$WhatIfPreference
+if ($null -ne $relaunchExit) { exit $relaunchExit }
 
 $problems = @()
 $say = { param($m) if (-not $Quiet) { Write-Host $m } }
@@ -35,14 +37,14 @@ try {
     # Ours: on WinUSB via the inbox INF. Includes devices not plugged in right now,
     # so an old port's entry does not keep the binding around.
     $targets = @(Get-CrestronUsbDevices -All | Where-Object {
-        $_.Service -ieq 'WINUSB' -and (Split-Path $_.InfPath -Leaf) -ieq 'winusb.inf'
+        $_.Service -ieq 'WINUSB' -and $_.InfPath -and (Split-Path $_.InfPath -Leaf) -ieq 'winusb.inf'
     })
     $anyPresent = $false
     foreach ($d in $targets) {
         if ($PSCmdlet.ShouldProcess($d.InstanceId, 'Remove device entry (unbinds WinUSB)')) {
             & $say "Removing $($d.InstanceId)$(if (-not $d.Present) { ' (not connected)' })"
             $r = Invoke-PnpUtil @('/remove-device', $d.InstanceId)
-            if ($r.ExitCode -ne 0 -and $r.ExitCode -ne 3010) {
+            if ($PnpUtilSuccess -notcontains $r.ExitCode) {
                 $problems += "pnputil could not remove $($d.InstanceId) (exit $($r.ExitCode)): $($r.Output)"
             }
             if ($d.Present) { $anyPresent = $true }
@@ -50,7 +52,7 @@ try {
     }
     if ($anyPresent) { Invoke-PnpUtil @('/scan-devices') | Out-Null }
 
-    if (@(Get-LegacyCertificates).Count -or @(Get-LegacyDriverPackages).Count) {
+    if (Test-LegacyInstall) {
         if ($PSCmdlet.ShouldProcess('old ArmUsb driver package and signing certificate', 'Remove')) {
             $problems += @(Remove-LegacyInstall -Say $say)
         }
